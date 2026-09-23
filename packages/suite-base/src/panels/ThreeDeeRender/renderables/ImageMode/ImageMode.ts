@@ -840,6 +840,9 @@ export class ImageMode
       material: undefined,
       geometry: undefined,
       mesh: undefined,
+      depthCloudPoints: undefined,
+      depthCloudGeometry: undefined,
+      depthCloudMaterial: undefined,
     });
 
     this.add(renderable);

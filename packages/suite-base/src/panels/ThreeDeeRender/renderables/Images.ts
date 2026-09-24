@@ -36,6 +36,7 @@ import { cameraInfosEqual, normalizeCameraInfo } from "./projections";
 import type { AnyRendererSubscription, IRenderer } from "../IRenderer";
 import { PartialMessageEvent, SceneExtension, onlyLastByTopicMessage } from "../SceneExtension";
 import { SettingsTreeEntry } from "../SettingsManager";
+import { ColorModeSettings, colorModeSettingsFields } from "./colorMode";
 import {
   CAMERA_CALIBRATION_DATATYPES,
   COMPRESSED_IMAGE_DATATYPES,
@@ -57,12 +58,17 @@ import { makePose, AnyFrameId } from "../transforms";
 const log = Logger.getLogger(__filename);
 void log;
 
-export type LayerSettingsImage = BaseSettings & {
-  cameraInfoTopic: string | undefined;
-  distance: number;
-  planarProjectionFactor: number;
-  color: string;
-};
+export type LayerSettingsImage = BaseSettings &
+  Partial<ColorModeSettings> & {
+    cameraInfoTopic: string | undefined;
+    distance: number;
+    planarProjectionFactor: number;
+    color: string;
+    renderMode: "image" | "depthCloud";
+    depthDistanceType: "z-axis" | "euclidean";
+    depthPointSize: number;
+    depthScale: number | undefined;
+  };
 
 const DEFAULT_BITMAP_WIDTH = 512;
 const NO_CAMERA_INFO_ERR = "NoCameraInfo";
@@ -212,6 +218,9 @@ export class Images extends SceneExtension<ImageRenderable> {
       cameraInfoOptions.sort();
       sortPrefixMatchesToFront(cameraInfoOptions, imageTopic, (option) => option.value);
 
+      const renderMode = config.renderMode ?? "image";
+      const isDepthCloud = renderMode === "depthCloud";
+
       const fields: SettingsTreeFields = {
         cameraInfoTopic: {
           label: t("threeDee:cameraInfo"),
@@ -219,25 +228,76 @@ export class Images extends SceneExtension<ImageRenderable> {
           options: cameraInfoOptions,
           value: config.cameraInfoTopic,
         },
-        distance: {
-          label: t("threeDee:distance"),
-          input: "number",
-          placeholder: String(IMAGE_RENDERABLE_DEFAULT_SETTINGS.distance),
-          step: 0.1,
-          precision: PRECISION_DISTANCE,
-          value: config.distance,
+        renderMode: {
+          label: t("threeDee:depthCloudRenderMode"),
+          input: "select",
+          options: [
+            { label: t("threeDee:depthCloudRenderModeImage"), value: "image" },
+            { label: t("threeDee:depthCloudRenderModeDepthCloud"), value: "depthCloud" },
+          ],
+          value: renderMode,
         },
-        planarProjectionFactor: {
-          label: t("threeDee:planarProjectionFactor"),
-          input: "number",
-          placeholder: String(IMAGE_RENDERABLE_DEFAULT_SETTINGS.planarProjectionFactor),
-          min: 0,
-          max: 1,
-          step: 0.1,
-          precision: 2,
-          value: config.planarProjectionFactor,
-        },
-        color: { label: t("threeDee:color"), input: "rgba", value: config.color },
+        ...(isDepthCloud
+          ? {
+              depthDistanceType: {
+                label: t("threeDee:depthCloudDistanceType"),
+                input: "select",
+                options: [
+                  { label: t("threeDee:depthCloudDistanceTypeZAxis"), value: "z-axis" },
+                  { label: t("threeDee:depthCloudDistanceTypeEuclidean"), value: "euclidean" },
+                ],
+                value: config.depthDistanceType ?? "z-axis",
+              },
+              depthPointSize: {
+                label: t("threeDee:depthCloudPointSize"),
+                input: "number",
+                placeholder: "2",
+                step: 1,
+                precision: 0,
+                min: 1,
+                value: config.depthPointSize,
+              },
+              depthScale: {
+                label: t("threeDee:depthCloudScale"),
+                input: "number",
+                placeholder: "auto",
+                step: 1,
+                precision: 0,
+                min: 1,
+                value: config.depthScale,
+              },
+              ...colorModeSettingsFields({
+                config,
+                defaults: { gradient: ["#0000ff", "#ff0000"] },
+                modifiers: {
+                  supportsPackedRgbModes: false,
+                  supportsRgbaFieldsMode: false,
+                  hideFlatColor: false,
+                  hideExplicitAlpha: false,
+                },
+              }),
+            }
+          : {
+              distance: {
+                label: t("threeDee:distance"),
+                input: "number",
+                placeholder: String(IMAGE_RENDERABLE_DEFAULT_SETTINGS.distance),
+                step: 0.1,
+                precision: PRECISION_DISTANCE,
+                value: config.distance,
+              },
+              planarProjectionFactor: {
+                label: t("threeDee:planarProjectionFactor"),
+                input: "number",
+                placeholder: String(IMAGE_RENDERABLE_DEFAULT_SETTINGS.planarProjectionFactor),
+                min: 0,
+                max: 1,
+                step: 0.1,
+                precision: 2,
+                value: config.planarProjectionFactor,
+              },
+              color: { label: t("threeDee:color"), input: "rgba", value: config.color },
+            }),
       };
 
       entries.push({
@@ -494,6 +554,9 @@ export class Images extends SceneExtension<ImageRenderable> {
       material: undefined,
       geometry: undefined,
       mesh: undefined,
+      depthCloudPoints: undefined,
+      depthCloudGeometry: undefined,
+      depthCloudMaterial: undefined,
     });
 
     this.add(renderable);

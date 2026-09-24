@@ -339,10 +339,8 @@ export class ImageRenderable extends Renderable<ImageUserData> {
   #scheduleCompressedDepthDecode(image: { format: string; data: Uint8Array }): void {
     const { format, data: imageData } = image;
     const seq = ++this.#depthCloudDecodeSeq;
-    console.debug("[DepthCloud] scheduleCompressedDepthDecode format=", format, "dataLen=", imageData.byteLength, "seq=", seq);
 
     const apply = (decoded: DecodedDepthImage | undefined) => {
-      console.debug("[DepthCloud] decode result:", decoded ? `${decoded.width}x${decoded.height} ${decoded.encoding}` : "undefined", "seq match:", seq === this.#depthCloudDecodeSeq);
       if (seq === this.#depthCloudDecodeSeq && decoded) {
         this.#depthCloudDecodedData = decoded;
         this.#depthCloudNeedsUpdate = true;
@@ -898,7 +896,6 @@ export class ImageRenderable extends Renderable<ImageUserData> {
     const image = this.userData.image;
     const cameraModel = this.userData.cameraModel;
     if (!image || !cameraModel) {
-      console.warn("[DepthCloud] missing image or cameraModel", { image: !!image, cameraModel: !!cameraModel });
       return;
     }
 
@@ -944,15 +941,11 @@ export class ImageRenderable extends Renderable<ImageUserData> {
     } else {
       // No decoded data yet — schedule async decode if image is compressed format
       if ("format" in image) {
-        console.debug("[DepthCloud] no data yet, scheduling decode for format=", (image as { format: string }).format);
         this.#scheduleCompressedDepthDecode(image);
-      } else {
-        console.warn("[DepthCloud] no depth data and no format field — encoding=", (image as { encoding?: string }).encoding);
       }
       return;
     }
 
-    console.debug("[DepthCloud] building", depthWidth, "x", depthHeight, "defaultScale=", defaultScale, "depthScale=", this.userData.settings.depthScale);
     const width = depthWidth;
     const height = depthHeight;
     // Auto depth scale: 16UC1 values are in mm (÷1000→m), 32FC1 are already in meters
@@ -1062,7 +1055,6 @@ export class ImageRenderable extends Renderable<ImageUserData> {
       this.userData.depthCloudMaterial,
     );
     this.add(this.userData.depthCloudPoints);
-    console.debug("[DepthCloud] built", count, "points");
   }
 
   #updateTexture(): void {

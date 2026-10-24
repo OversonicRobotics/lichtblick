@@ -171,7 +171,7 @@
     "react-refresh": "0.18.0",
     "rimraf": "6.0.1",
     "semver": "7.7.2",
-    "storybook": "10.5.10",
+    "storybook": "10.6.2",
     "ts-loader": "9.5.4",
     "ts-node": "10.9.2",
     "ts-unused-exports": "11.0.1",

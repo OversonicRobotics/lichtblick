@@ -113,6 +113,11 @@ export const threeDee = {
 
   // Images
   cameraInfo: "Camera info",
+  depthCloudPointSize: "Point size",
+  depthCloudRenderMode: "Render mode",
+  depthCloudRenderModeImage: "Image",
+  depthCloudRenderModeDepthCloud: "Depth cloud",
+  depthCloudScale: "Depth scale",
 
   // Occupancy Grids
   colorModeCustom: "Custom",

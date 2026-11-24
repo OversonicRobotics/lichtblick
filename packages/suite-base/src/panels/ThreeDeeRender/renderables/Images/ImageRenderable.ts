@@ -31,13 +31,20 @@ import { projectPixel } from "@lichtblick/suite-base/panels/ThreeDeeRender/rende
 import { RosValue } from "@lichtblick/suite-base/players/types";
 
 import { AnyImage, CompressedVideo } from "./ImageTypes";
+import { DEPTH_16UC1_SCALE, DEFAULT_MAX_DEPTH_M } from "./constants";
 import {
   decodeCompressedImageToBitmap,
   decodeCompressedVideoToBitmap,
   emptyVideoFrame,
   prepareVideoFrame,
 } from "./decodeImage";
-import { PreparedVideoFrame, PreparedVideoFrameStatus } from "./types";
+import {
+  DecodedDepthImage,
+  DepthCloudSettings,
+  ImageRenderMode,
+  PreparedVideoFrame,
+  PreparedVideoFrameStatus,
+} from "./types";
 import { CameraInfo } from "../../ros";
 import {
   DECODE_IMAGE_ERR_KEY,
@@ -47,10 +54,16 @@ import {
   INITIAL_CONTRAST,
   VERTEX_SHADER,
 } from "../ImageMode/constants";
-import { ColorModeSettings } from "../colorMode";
+import { ColorModeSettings, getColorConverter } from "../colorMode";
+import {
+  decodeCompressedDepth,
+  isCompressedDepthFormat,
+  tryDecodeDepthPng,
+} from "./decodeDepthImage";
 
 const log = Logger.getLogger(__filename);
-export interface ImageRenderableSettings extends Partial<ColorModeSettings> {
+
+export interface ImageRenderableSettings extends Partial<ColorModeSettings>, DepthCloudSettings {
   visible: boolean;
   frameLocked?: boolean;
   cameraInfoTopic: string | undefined;
@@ -72,6 +85,9 @@ export const IMAGE_RENDERABLE_DEFAULT_SETTINGS: ImageRenderableSettings = {
   color: "#ffffff",
   brightness: INITIAL_BRIGHTNESS,
   contrast: INITIAL_CONTRAST,
+  renderMode: ImageRenderMode.Image,
+  depthPointSize: 2,
+  depthScale: undefined,
 };
 
 const VIDEO_TIMESTAMP_JITTER_NS = 5_000_000n;
@@ -132,6 +148,10 @@ export type ImageUserData = BaseUserData & {
   material: THREE.ShaderMaterial | undefined;
   geometry: THREE.PlaneGeometry | undefined;
   mesh: THREE.Mesh | undefined;
+  // Depth cloud rendering
+  depthCloudPoints: THREE.Points | undefined;
+  depthCloudGeometry: THREE.BufferGeometry | undefined;
+  depthCloudMaterial: THREE.PointsMaterial | undefined;
 };
 
 export class ImageRenderable extends Renderable<ImageUserData> {
@@ -147,6 +167,11 @@ export class ImageRenderable extends Renderable<ImageUserData> {
   #textureNeedsUpdate = true;
   // set when material or texture changes
   #materialNeedsUpdate = true;
+
+  // Depth cloud state
+  #depthCloudNeedsUpdate = true;
+  #depthCloudDecodedData?: DecodedDepthImage;
+  #depthCloudDecodeSeq = 0;
 
   #renderBehindScene: boolean = false;
 
@@ -198,6 +223,8 @@ export class ImageRenderable extends Renderable<ImageUserData> {
     this.userData.texture?.dispose();
     this.userData.material?.dispose();
     this.userData.geometry?.dispose();
+    this.userData.depthCloudGeometry?.dispose();
+    this.userData.depthCloudMaterial?.dispose();
     this.videoPlayer?.close();
     this.decoder?.terminate();
     // Release the GOP backfill cache. Entries hold frame references and replay metadata for up to
@@ -236,7 +263,9 @@ export class ImageRenderable extends Renderable<ImageUserData> {
 
   // Renderable should only need to care about the model
   public setCameraModel(cameraModel: ICameraModel): void {
-    this.#geometryNeedsUpdate ||= this.userData.cameraModel !== cameraModel;
+    const changed = this.userData.cameraModel !== cameraModel;
+    this.#geometryNeedsUpdate ||= changed;
+    this.#depthCloudNeedsUpdate ||= changed;
     this.userData.cameraModel = cameraModel;
   }
 
@@ -274,19 +303,78 @@ export class ImageRenderable extends Renderable<ImageUserData> {
       prevSettings.maxValue !== newSettings.maxValue
     ) {
       this.userData.settings = newSettings;
-      // Decode the current image again, which takes into account the new options
-      const image = this.userData.image;
-      if (image) {
-        this.setImage(image);
+      if (newSettings.renderMode === ImageRenderMode.DepthCloud) {
+        this.#depthCloudNeedsUpdate = true;
+      } else {
+        // Decode the current image again, which takes into account the new options
+        const image = this.userData.image;
+        if (image) {
+          this.setImage(image);
+        }
       }
       return;
+    }
+
+    if (
+      prevSettings.renderMode !== newSettings.renderMode ||
+      prevSettings.depthPointSize !== newSettings.depthPointSize ||
+      prevSettings.depthScale !== newSettings.depthScale ||
+      prevSettings.explicitAlpha !== newSettings.explicitAlpha
+    ) {
+      this.#depthCloudNeedsUpdate = true;
+      // When switching to depth cloud mode, kick off the async decode if we already have an image
+      if (
+        prevSettings.renderMode !== newSettings.renderMode &&
+        newSettings.renderMode === ImageRenderMode.DepthCloud
+      ) {
+        const image = this.userData.image;
+        if (image && "format" in image) {
+          this.#scheduleCompressedDepthDecode(image);
+        }
+      }
     }
 
     this.userData.settings = newSettings;
   }
 
+  #scheduleCompressedDepthDecode(image: { format: string; data: Uint8Array }): void {
+    const { format, data: imageData } = image;
+    const seq = ++this.#depthCloudDecodeSeq;
+
+    const apply = (decoded: DecodedDepthImage | undefined) => {
+      if (seq === this.#depthCloudDecodeSeq && decoded) {
+        this.#depthCloudDecodedData = decoded;
+        this.#depthCloudNeedsUpdate = true;
+        this.update();
+        this.renderer.queueAnimationFrame();
+      }
+    };
+
+    if (isCompressedDepthFormat(format)) {
+      decodeCompressedDepth(imageData, format)
+        .then(apply)
+        .catch((e: unknown) => {
+          log.error("[DepthCloud] decodeCompressedDepth error:", e);
+        });
+    } else if (format === "png" || format.endsWith("/png")) {
+      tryDecodeDepthPng(imageData)
+        .then(apply)
+        .catch((e: unknown) => {
+          log.error("[DepthCloud] tryDecodeDepthPng error:", e);
+        });
+    } else {
+      log.warn("[DepthCloud] unhandled format:", format);
+    }
+  }
+
   public setImage(image: AnyImage, resizeWidth?: number, onDecoded?: () => void): void {
     this.userData.image = image;
+    this.#depthCloudNeedsUpdate = true;
+
+    // Async decode for compressed depth images (foxglove.CompressedImage / sensor_msgs/CompressedImage)
+    if (this.userData.settings.renderMode === ImageRenderMode.DepthCloud && "format" in image) {
+      this.#scheduleCompressedDepthDecode(image);
+    }
 
     const seq = ++this.#receivedImageSequenceNumber;
     const incomingFormat = "format" in image ? image.format : undefined;
@@ -746,34 +834,56 @@ export class ImageRenderable extends Renderable<ImageUserData> {
     }
     this.#isUpdating = true;
 
-    if (this.#textureNeedsUpdate && this.#decodedImage) {
-      this.#updateTexture();
-      this.#textureNeedsUpdate = false;
-    }
-
     if (this.userData.image) {
       this.updateHeaderInfo();
     }
 
-    if (this.#geometryNeedsUpdate && this.userData.cameraModel) {
-      this.#rebuildGeometry();
-      this.#geometryNeedsUpdate = false;
+    const isDepthCloud = this.userData.settings.renderMode === ImageRenderMode.DepthCloud;
+
+    if (isDepthCloud) {
+      // Hide flat mesh
+      if (this.userData.mesh) {
+        this.userData.mesh.visible = false;
+      }
+      if (this.#depthCloudNeedsUpdate && this.userData.image && this.userData.cameraModel) {
+        this.#rebuildDepthCloud();
+        this.#depthCloudNeedsUpdate = false;
+      }
+      if (this.userData.depthCloudPoints) {
+        this.userData.depthCloudPoints.visible = true;
+      }
+    } else {
+      // Hide depth cloud
+      if (this.userData.depthCloudPoints) {
+        this.userData.depthCloudPoints.visible = false;
+      }
+
+      if (this.#textureNeedsUpdate && this.#decodedImage) {
+        this.#updateTexture();
+        this.#textureNeedsUpdate = false;
+      }
+
+      if (this.#geometryNeedsUpdate && this.userData.cameraModel) {
+        this.#rebuildGeometry();
+        this.#geometryNeedsUpdate = false;
+      }
+
+      if (this.#materialNeedsUpdate) {
+        this.#updateMaterial();
+        this.#materialNeedsUpdate = false;
+      }
+
+      if (
+        this.#meshNeedsUpdate &&
+        this.userData.texture &&
+        this.userData.geometry &&
+        this.userData.material
+      ) {
+        this.#updateMesh();
+        this.#meshNeedsUpdate = false;
+      }
     }
 
-    if (this.#materialNeedsUpdate) {
-      this.#updateMaterial();
-      this.#materialNeedsUpdate = false;
-    }
-
-    if (
-      this.#meshNeedsUpdate &&
-      this.userData.texture &&
-      this.userData.geometry &&
-      this.userData.material
-    ) {
-      this.#updateMesh();
-      this.#meshNeedsUpdate = false;
-    }
     this.#isUpdating = false;
   }
 
@@ -785,6 +895,168 @@ export class ImageRenderable extends Renderable<ImageUserData> {
     const geometry = createGeometry(this.userData.cameraModel, this.userData.settings);
     this.userData.geometry = geometry;
     this.#meshNeedsUpdate = true;
+  }
+
+  #rebuildDepthCloud(): void {
+    const image = this.userData.image;
+    const cameraModel = this.userData.cameraModel;
+    if (!image || !cameraModel) {
+      return;
+    }
+
+    const settings = this.userData.settings;
+
+    // Determine data source: raw uncompressed image or async-decoded compressed depth
+    let depthWidth: number;
+    let depthHeight: number;
+    let getDepth: (row: number, col: number) => number; // returns raw depth value (pre-scale)
+    let defaultScale: number;
+
+    if ("encoding" in image && (image.encoding === "16UC1" || image.encoding === "32FC1")) {
+      // Raw uncompressed depth image
+      const enc = image.encoding;
+      depthWidth = image.width;
+      depthHeight = image.height;
+      const step = image.step > 0 ? image.step : depthWidth * (enc === "16UC1" ? 2 : 4);
+      const isBigEndian = "is_bigendian" in image && image.is_bigendian;
+      const rawData = image.data;
+      const view = new DataView(rawData.buffer, rawData.byteOffset, rawData.byteLength);
+      defaultScale = enc === "16UC1" ? DEPTH_16UC1_SCALE : 1.0;
+      if (enc === "16UC1") {
+        getDepth = (row, col) => view.getUint16(row * step + col * 2, !isBigEndian);
+      } else {
+        getDepth = (row, col) => view.getFloat32(row * step + col * 4, !isBigEndian);
+      }
+    } else if (this.#depthCloudDecodedData) {
+      // Async-decoded compressed depth image
+      const decoded = this.#depthCloudDecodedData;
+      depthWidth = decoded.width;
+      depthHeight = decoded.height;
+      defaultScale = decoded.encoding === "16UC1" ? DEPTH_16UC1_SCALE : 1.0;
+      if (decoded.data instanceof Uint16Array) {
+        const u16 = decoded.data;
+        getDepth = (row, col) => u16[row * decoded.width + col] ?? 0;
+      } else {
+        const f32 = decoded.data;
+        getDepth = (row, col) => f32[row * decoded.width + col] ?? 0;
+      }
+    } else {
+      // No decoded data yet — schedule async decode if image is compressed format
+      if ("format" in image) {
+        this.#scheduleCompressedDepthDecode(image);
+      }
+      return;
+    }
+
+    const width = depthWidth;
+    const height = depthHeight;
+    // Auto depth scale: 16UC1 values are in mm (÷1000→m), 32FC1 are already in meters
+    const depthScale = settings.depthScale ?? defaultScale;
+
+    const maxPoints = width * height;
+    const positions = new Float32Array(maxPoints * 3);
+    const colors = new Float32Array(maxPoints * 3);
+
+    const minDepth = settings.minValue ?? 0;
+    const maxDepth = settings.maxValue ?? DEFAULT_MAX_DEPTH_M;
+
+    const colorSettings: ColorModeSettings = {
+      colorMode: settings.colorMode ?? "colormap",
+      flatColor: settings.flatColor ?? "#ffffff",
+      gradient: settings.gradient ?? ["#0000ff", "#ff0000"],
+      colorMap: settings.colorMap ?? "turbo",
+      explicitAlpha: settings.explicitAlpha ?? 1,
+      minValue: minDepth,
+      maxValue: maxDepth,
+    };
+    const colorConverter = getColorConverter(
+      {
+        ...colorSettings,
+        colorMode: colorSettings.colorMode as Exclude<
+          ColorModeSettings["colorMode"],
+          "rgba-fields"
+        >,
+      },
+      minDepth,
+      maxDepth,
+    );
+    const tempColor = { r: 0, g: 0, b: 0, a: 1 };
+    const tempOut = { x: 0, y: 0, z: 0 };
+    const tempPixel = { x: 0, y: 0 };
+
+    let count = 0;
+
+    for (let row = 0; row < height; row++) {
+      for (let col = 0; col < width; col++) {
+        const rawDepth = getDepth(row, col);
+
+        if (rawDepth === 0 || !isFinite(rawDepth)) {
+          continue;
+        }
+
+        const depthM = rawDepth / depthScale;
+        if (depthM < minDepth || depthM > maxDepth) {
+          continue;
+        }
+
+        tempPixel.x = col;
+        tempPixel.y = row;
+        cameraModel.projectPixelTo3dRay(tempOut, tempPixel);
+
+        // Scale ray so its z component equals depthM.
+        const scale = tempOut.z === 0 ? depthM : depthM / tempOut.z;
+
+        const idx = count * 3;
+        positions[idx] = tempOut.x * scale;
+        positions[idx + 1] = tempOut.y * scale;
+        positions[idx + 2] = tempOut.z * scale;
+
+        colorConverter(tempColor, depthM);
+        colors[idx] = tempColor.r;
+        colors[idx + 1] = tempColor.g;
+        colors[idx + 2] = tempColor.b;
+
+        count++;
+      }
+    }
+
+    // Rebuild geometry
+    this.userData.depthCloudGeometry?.dispose();
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute(
+      "position",
+      new THREE.Float32BufferAttribute(new Float32Array(positions.buffer, 0, count * 3), 3),
+    );
+    geometry.setAttribute(
+      "color",
+      new THREE.Float32BufferAttribute(new Float32Array(colors.buffer, 0, count * 3), 3),
+    );
+    geometry.computeBoundingSphere();
+    this.userData.depthCloudGeometry = geometry;
+
+    const opacity = settings.explicitAlpha ?? 1.0;
+    if (!this.userData.depthCloudMaterial) {
+      this.userData.depthCloudMaterial = new THREE.PointsMaterial({
+        size: settings.depthPointSize,
+        vertexColors: true,
+        sizeAttenuation: false,
+        transparent: opacity < 1,
+        opacity,
+        depthWrite: opacity >= 1,
+      });
+    } else {
+      this.userData.depthCloudMaterial.size = settings.depthPointSize;
+      this.userData.depthCloudMaterial.opacity = opacity;
+      this.userData.depthCloudMaterial.transparent = opacity < 1;
+      this.userData.depthCloudMaterial.depthWrite = opacity >= 1;
+      this.userData.depthCloudMaterial.needsUpdate = true;
+    }
+
+    if (this.userData.depthCloudPoints) {
+      this.remove(this.userData.depthCloudPoints);
+    }
+    this.userData.depthCloudPoints = new THREE.Points(geometry, this.userData.depthCloudMaterial);
+    this.add(this.userData.depthCloudPoints);
   }
 
   #updateTexture(): void {

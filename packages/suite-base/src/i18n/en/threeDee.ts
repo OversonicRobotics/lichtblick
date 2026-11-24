@@ -113,9 +113,6 @@ export const threeDee = {
 
   // Images
   cameraInfo: "Camera info",
-  depthCloudDistanceType: "Distance type",
-  depthCloudDistanceTypeZAxis: "Z-axis",
-  depthCloudDistanceTypeEuclidean: "Euclidean",
   depthCloudPointSize: "Point size",
   depthCloudRenderMode: "Render mode",
   depthCloudRenderModeImage: "Image",

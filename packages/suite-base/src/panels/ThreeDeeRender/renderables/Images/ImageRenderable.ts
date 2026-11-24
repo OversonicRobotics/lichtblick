@@ -31,13 +31,20 @@ import { projectPixel } from "@lichtblick/suite-base/panels/ThreeDeeRender/rende
 import { RosValue } from "@lichtblick/suite-base/players/types";
 
 import { AnyImage, CompressedVideo } from "./ImageTypes";
+import { DEPTH_16UC1_SCALE, DEFAULT_MAX_DEPTH_M } from "./constants";
 import {
   decodeCompressedImageToBitmap,
   decodeCompressedVideoToBitmap,
   emptyVideoFrame,
   prepareVideoFrame,
 } from "./decodeImage";
-import { PreparedVideoFrame, PreparedVideoFrameStatus } from "./types";
+import {
+  DecodedDepthImage,
+  DepthCloudSettings,
+  ImageRenderMode,
+  PreparedVideoFrame,
+  PreparedVideoFrameStatus,
+} from "./types";
 import { CameraInfo } from "../../ros";
 import {
   DECODE_IMAGE_ERR_KEY,
@@ -49,14 +56,14 @@ import {
 } from "../ImageMode/constants";
 import { ColorModeSettings, getColorConverter } from "../colorMode";
 import {
-  DecodedDepthImage,
   decodeCompressedDepth,
   isCompressedDepthFormat,
   tryDecodeDepthPng,
 } from "./decodeDepthImage";
 
 const log = Logger.getLogger(__filename);
-export interface ImageRenderableSettings extends Partial<ColorModeSettings> {
+
+export interface ImageRenderableSettings extends Partial<ColorModeSettings>, DepthCloudSettings {
   visible: boolean;
   frameLocked?: boolean;
   cameraInfoTopic: string | undefined;
@@ -65,10 +72,6 @@ export interface ImageRenderableSettings extends Partial<ColorModeSettings> {
   color: string;
   brightness: number;
   contrast: number;
-  renderMode: "image" | "depthCloud";
-  depthDistanceType: "z-axis" | "euclidean";
-  depthPointSize: number;
-  depthScale: number | undefined;
 }
 
 const DEFAULT_DISTANCE = 1;
@@ -82,8 +85,7 @@ export const IMAGE_RENDERABLE_DEFAULT_SETTINGS: ImageRenderableSettings = {
   color: "#ffffff",
   brightness: INITIAL_BRIGHTNESS,
   contrast: INITIAL_CONTRAST,
-  renderMode: "image",
-  depthDistanceType: "z-axis",
+  renderMode: ImageRenderMode.Image,
   depthPointSize: 2,
   depthScale: undefined,
 };
@@ -301,7 +303,7 @@ export class ImageRenderable extends Renderable<ImageUserData> {
       prevSettings.maxValue !== newSettings.maxValue
     ) {
       this.userData.settings = newSettings;
-      if (newSettings.renderMode === "depthCloud") {
+      if (newSettings.renderMode === ImageRenderMode.DepthCloud) {
         this.#depthCloudNeedsUpdate = true;
       } else {
         // Decode the current image again, which takes into account the new options
@@ -315,7 +317,6 @@ export class ImageRenderable extends Renderable<ImageUserData> {
 
     if (
       prevSettings.renderMode !== newSettings.renderMode ||
-      prevSettings.depthDistanceType !== newSettings.depthDistanceType ||
       prevSettings.depthPointSize !== newSettings.depthPointSize ||
       prevSettings.depthScale !== newSettings.depthScale ||
       prevSettings.explicitAlpha !== newSettings.explicitAlpha
@@ -324,7 +325,7 @@ export class ImageRenderable extends Renderable<ImageUserData> {
       // When switching to depth cloud mode, kick off the async decode if we already have an image
       if (
         prevSettings.renderMode !== newSettings.renderMode &&
-        newSettings.renderMode === "depthCloud"
+        newSettings.renderMode === ImageRenderMode.DepthCloud
       ) {
         const image = this.userData.image;
         if (image && "format" in image) {
@@ -350,11 +351,19 @@ export class ImageRenderable extends Renderable<ImageUserData> {
     };
 
     if (isCompressedDepthFormat(format)) {
-      decodeCompressedDepth(imageData, format).then(apply).catch((e: unknown) => { console.error("[DepthCloud] decodeCompressedDepth error:", e); });
+      decodeCompressedDepth(imageData, format)
+        .then(apply)
+        .catch((e: unknown) => {
+          log.error("[DepthCloud] decodeCompressedDepth error:", e);
+        });
     } else if (format === "png" || format.endsWith("/png")) {
-      tryDecodeDepthPng(imageData).then(apply).catch((e: unknown) => { console.error("[DepthCloud] tryDecodeDepthPng error:", e); });
+      tryDecodeDepthPng(imageData)
+        .then(apply)
+        .catch((e: unknown) => {
+          log.error("[DepthCloud] tryDecodeDepthPng error:", e);
+        });
     } else {
-      console.warn("[DepthCloud] unhandled format:", format);
+      log.warn("[DepthCloud] unhandled format:", format);
     }
   }
 
@@ -363,7 +372,7 @@ export class ImageRenderable extends Renderable<ImageUserData> {
     this.#depthCloudNeedsUpdate = true;
 
     // Async decode for compressed depth images (foxglove.CompressedImage / sensor_msgs/CompressedImage)
-    if (this.userData.settings.renderMode === "depthCloud" && "format" in image) {
+    if (this.userData.settings.renderMode === ImageRenderMode.DepthCloud && "format" in image) {
       this.#scheduleCompressedDepthDecode(image);
     }
 
@@ -829,18 +838,14 @@ export class ImageRenderable extends Renderable<ImageUserData> {
       this.updateHeaderInfo();
     }
 
-    const isDepthCloud = this.userData.settings.renderMode === "depthCloud";
+    const isDepthCloud = this.userData.settings.renderMode === ImageRenderMode.DepthCloud;
 
     if (isDepthCloud) {
       // Hide flat mesh
       if (this.userData.mesh) {
         this.userData.mesh.visible = false;
       }
-      if (
-        this.#depthCloudNeedsUpdate &&
-        this.userData.image &&
-        this.userData.cameraModel
-      ) {
+      if (this.#depthCloudNeedsUpdate && this.userData.image && this.userData.cameraModel) {
         this.#rebuildDepthCloud();
         this.#depthCloudNeedsUpdate = false;
       }
@@ -907,19 +912,16 @@ export class ImageRenderable extends Renderable<ImageUserData> {
     let getDepth: (row: number, col: number) => number; // returns raw depth value (pre-scale)
     let defaultScale: number;
 
-    if ("encoding" in image && ("encoding" in image ? image.encoding === "16UC1" || image.encoding === "32FC1" : false)) {
+    if ("encoding" in image && (image.encoding === "16UC1" || image.encoding === "32FC1")) {
       // Raw uncompressed depth image
-      const enc = (image as { encoding: string }).encoding as "16UC1" | "32FC1";
-      depthWidth = (image as { width: number }).width;
-      depthHeight = (image as { height: number }).height;
-      const step = "step" in image
-        ? (image as { step: number }).step
-        : depthWidth * (enc === "16UC1" ? 2 : 4);
-      const isBigEndian =
-        "is_bigendian" in image ? (image as unknown as { is_bigendian: number }).is_bigendian !== 0 : false;
-      const rawData = (image as { data: Uint8Array }).data;
+      const enc = image.encoding;
+      depthWidth = image.width;
+      depthHeight = image.height;
+      const step = image.step > 0 ? image.step : depthWidth * (enc === "16UC1" ? 2 : 4);
+      const isBigEndian = "is_bigendian" in image && image.is_bigendian;
+      const rawData = image.data;
       const view = new DataView(rawData.buffer, rawData.byteOffset, rawData.byteLength);
-      defaultScale = enc === "16UC1" ? 1000.0 : 1.0;
+      defaultScale = enc === "16UC1" ? DEPTH_16UC1_SCALE : 1.0;
       if (enc === "16UC1") {
         getDepth = (row, col) => view.getUint16(row * step + col * 2, !isBigEndian);
       } else {
@@ -930,7 +932,7 @@ export class ImageRenderable extends Renderable<ImageUserData> {
       const decoded = this.#depthCloudDecodedData;
       depthWidth = decoded.width;
       depthHeight = decoded.height;
-      defaultScale = decoded.encoding === "16UC1" ? 1000.0 : 1.0;
+      defaultScale = decoded.encoding === "16UC1" ? DEPTH_16UC1_SCALE : 1.0;
       if (decoded.data instanceof Uint16Array) {
         const u16 = decoded.data;
         getDepth = (row, col) => u16[row * decoded.width + col] ?? 0;
@@ -956,10 +958,10 @@ export class ImageRenderable extends Renderable<ImageUserData> {
     const colors = new Float32Array(maxPoints * 3);
 
     const minDepth = settings.minValue ?? 0;
-    const maxDepth = settings.maxValue ?? 10.0;
+    const maxDepth = settings.maxValue ?? DEFAULT_MAX_DEPTH_M;
 
     const colorSettings: ColorModeSettings = {
-      colorMode: (settings.colorMode!) ?? "colormap",
+      colorMode: settings.colorMode ?? "colormap",
       flatColor: settings.flatColor ?? "#ffffff",
       gradient: settings.gradient ?? ["#0000ff", "#ff0000"],
       colorMap: settings.colorMap ?? "turbo",
@@ -968,7 +970,13 @@ export class ImageRenderable extends Renderable<ImageUserData> {
       maxValue: maxDepth,
     };
     const colorConverter = getColorConverter(
-      { ...colorSettings, colorMode: colorSettings.colorMode as Exclude<ColorModeSettings["colorMode"], "rgba-fields"> },
+      {
+        ...colorSettings,
+        colorMode: colorSettings.colorMode as Exclude<
+          ColorModeSettings["colorMode"],
+          "rgba-fields"
+        >,
+      },
       minDepth,
       maxDepth,
     );
@@ -977,7 +985,6 @@ export class ImageRenderable extends Renderable<ImageUserData> {
     const tempPixel = { x: 0, y: 0 };
 
     let count = 0;
-    const distanceType = settings.depthDistanceType ?? "z-axis";
 
     for (let row = 0; row < height; row++) {
       for (let col = 0; col < width; col++) {
@@ -996,10 +1003,8 @@ export class ImageRenderable extends Renderable<ImageUserData> {
         tempPixel.y = row;
         cameraModel.projectPixelTo3dRay(tempOut, tempPixel);
 
-        // Z-axis: scale ray so its z component equals depthM.
-        // Euclidean: scale ray (unit length) by depthM directly.
-        const scale =
-          distanceType === "euclidean" || tempOut.z === 0 ? depthM : depthM / tempOut.z;
+        // Scale ray so its z component equals depthM.
+        const scale = tempOut.z === 0 ? depthM : depthM / tempOut.z;
 
         const idx = count * 3;
         positions[idx] = tempOut.x * scale;
@@ -1050,10 +1055,7 @@ export class ImageRenderable extends Renderable<ImageUserData> {
     if (this.userData.depthCloudPoints) {
       this.remove(this.userData.depthCloudPoints);
     }
-    this.userData.depthCloudPoints = new THREE.Points(
-      geometry,
-      this.userData.depthCloudMaterial,
-    );
+    this.userData.depthCloudPoints = new THREE.Points(geometry, this.userData.depthCloudMaterial);
     this.add(this.userData.depthCloudPoints);
   }
 

@@ -7,6 +7,25 @@
 
 import { H265ParserContext } from "@lichtblick/den/video";
 
+export enum ImageRenderMode {
+  Image = "image",
+  DepthCloud = "depthCloud",
+}
+
+export type DepthCloudSettings = {
+  renderMode: ImageRenderMode;
+  depthPointSize: number;
+  depthScale: number | undefined;
+};
+
+export type DecodedDepthImage = {
+  /** Raw depth values: uint16 (mm for 16UC1) or reconstructed float32 (m for 32FC1) */
+  data: Uint16Array | Float32Array;
+  encoding: "16UC1" | "32FC1";
+  width: number;
+  height: number;
+};
+
 /**
  * Discriminator returned alongside each prepared video frame so callers can branch on the parse
  * result without doing string-equality on the human-readable `diagnostics` message.

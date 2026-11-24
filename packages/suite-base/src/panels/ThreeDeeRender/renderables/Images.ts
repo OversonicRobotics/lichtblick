@@ -17,11 +17,6 @@ import { toNanoSec } from "@lichtblick/rostime";
 import { SettingsTreeAction, SettingsTreeFields } from "@lichtblick/suite";
 import { ALL_SUPPORTED_IMAGE_SCHEMAS } from "@lichtblick/suite-base/panels/ThreeDeeRender/renderables/ImageMode/constants";
 
-import {
-  IMAGE_RENDERABLE_DEFAULT_SETTINGS,
-  ImageRenderable,
-  ImageUserData,
-} from "./Images/ImageRenderable";
 import { ALL_CAMERA_INFO_SCHEMAS, AnyImage, CompressedVideo } from "./Images/ImageTypes";
 import { filterCompressedVideoQueue } from "./Images/filterCompressedVideoQueue";
 import {
@@ -54,20 +49,23 @@ import {
 import { BaseSettings, PRECISION_DISTANCE } from "../settings";
 import { topicIsConvertibleToSchema } from "../topicIsConvertibleToSchema";
 import { makePose, AnyFrameId } from "../transforms";
+import {
+  IMAGE_RENDERABLE_DEFAULT_SETTINGS,
+  ImageRenderable,
+  ImageUserData,
+} from "./Images/ImageRenderable";
+import { DepthCloudSettings, ImageRenderMode } from "./Images/types";
 
 const log = Logger.getLogger(__filename);
 void log;
 
 export type LayerSettingsImage = BaseSettings &
-  Partial<ColorModeSettings> & {
+  Partial<ColorModeSettings> &
+  DepthCloudSettings & {
     cameraInfoTopic: string | undefined;
     distance: number;
     planarProjectionFactor: number;
     color: string;
-    renderMode: "image" | "depthCloud";
-    depthDistanceType: "z-axis" | "euclidean";
-    depthPointSize: number;
-    depthScale: number | undefined;
   };
 
 const DEFAULT_BITMAP_WIDTH = 512;
@@ -218,8 +216,8 @@ export class Images extends SceneExtension<ImageRenderable> {
       cameraInfoOptions.sort();
       sortPrefixMatchesToFront(cameraInfoOptions, imageTopic, (option) => option.value);
 
-      const renderMode = config.renderMode ?? "image";
-      const isDepthCloud = renderMode === "depthCloud";
+      const renderMode = config.renderMode ?? ImageRenderMode.Image;
+      const isDepthCloud = renderMode === ImageRenderMode.DepthCloud;
 
       const fields: SettingsTreeFields = {
         cameraInfoTopic: {
@@ -232,26 +230,20 @@ export class Images extends SceneExtension<ImageRenderable> {
           label: t("threeDee:depthCloudRenderMode"),
           input: "select",
           options: [
-            { label: t("threeDee:depthCloudRenderModeImage"), value: "image" },
-            { label: t("threeDee:depthCloudRenderModeDepthCloud"), value: "depthCloud" },
+            { label: t("threeDee:depthCloudRenderModeImage"), value: ImageRenderMode.Image },
+            {
+              label: t("threeDee:depthCloudRenderModeDepthCloud"),
+              value: ImageRenderMode.DepthCloud,
+            },
           ],
           value: renderMode,
         },
         ...(isDepthCloud
           ? {
-              depthDistanceType: {
-                label: t("threeDee:depthCloudDistanceType"),
-                input: "select",
-                options: [
-                  { label: t("threeDee:depthCloudDistanceTypeZAxis"), value: "z-axis" },
-                  { label: t("threeDee:depthCloudDistanceTypeEuclidean"), value: "euclidean" },
-                ],
-                value: config.depthDistanceType ?? "z-axis",
-              },
               depthPointSize: {
                 label: t("threeDee:depthCloudPointSize"),
                 input: "number",
-                placeholder: "2",
+                placeholder: String(IMAGE_RENDERABLE_DEFAULT_SETTINGS.depthPointSize),
                 step: 1,
                 precision: 0,
                 min: 1,

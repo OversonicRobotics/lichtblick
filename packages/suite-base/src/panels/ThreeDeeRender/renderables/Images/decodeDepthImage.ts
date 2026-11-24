@@ -15,13 +15,7 @@
 //   - 16UC1;compressedDepth: optional 12-byte header (int32 format + float32 quantization + float32 minDepth) + PNG
 //   - 32FC1;compressedDepth: 12-byte header + PNG (quantized 16-bit values requiring float reconstruction)
 
-export type DecodedDepthImage = {
-  /** Raw depth values: uint16 (mm for 16UC1) or reconstructed float32 (m for 32FC1) */
-  data: Uint16Array | Float32Array;
-  encoding: "16UC1" | "32FC1";
-  width: number;
-  height: number;
-};
+import { DecodedDepthImage } from "./types";
 
 const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 const COMPRESSED_DEPTH_HEADER_SIZE = 12;
@@ -84,7 +78,7 @@ export async function decodeCompressedDepth(
   // 16UC1: values are in mm, keep as uint16
   return {
     data: decoded.pixels,
-    encoding: (is32FC1 ? "32FC1" : "16UC1"),
+    encoding: is32FC1 ? "32FC1" : "16UC1",
     width: decoded.width,
     height: decoded.height,
   };
@@ -94,9 +88,7 @@ export async function decodeCompressedDepth(
  * Attempt to decode a plain PNG (format: "png") as 16-bit grayscale depth.
  * Returns undefined if not a 16-bit grayscale PNG.
  */
-export async function tryDecodeDepthPng(
-  data: Uint8Array,
-): Promise<DecodedDepthImage | undefined> {
+export async function tryDecodeDepthPng(data: Uint8Array): Promise<DecodedDepthImage | undefined> {
   if (!hasPngSignature(data, 0)) {
     return undefined;
   }
@@ -169,7 +161,7 @@ async function decode16BitGrayscalePng(data: Uint8Array): Promise<ParsedPng | un
       bitDepth = data[offset + 8]!;
       colorType = data[offset + 9]!;
     } else if (type === "IDAT") {
-      idatChunks.push(data.slice(offset, offset + length));
+      idatChunks.push(data.subarray(offset, offset + length));
     } else if (type === "IEND") {
       break;
     }
